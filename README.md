@@ -1,5 +1,3 @@
-# MIT-xv6-COW
-
 # xv6 Copy-on-Write Fork Implementation Guide
 
 ## Overview
