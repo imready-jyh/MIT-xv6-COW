@@ -299,7 +299,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -308,13 +307,20 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;   // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    // If page is writable, mark as COW and remove write permission
+    if(flags & PTE_W) {
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
+    }
+
+    // Map the same physical page in child with same flags
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+
+    // Increment reference count since page is now shared
+    increfcnt((void*)pa);
   }
   return 0;
 
@@ -358,6 +364,15 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     }
 
     pte = walk(pagetable, va0, 0);
+
+    // Handle COW page before checking PTE_W
+    if(*pte & PTE_COW) {
+      if(cowhandler(pagetable, va0) < 0)
+        return -1;
+      pte = walk(pagetable, va0, 0);
+      pa0 = PTE2PA(*pte);  // Update pa0 after COW handling
+    }
+
     // forbid copyout over read-only user text pages.
     if((*pte & PTE_W) == 0)
       return -1;

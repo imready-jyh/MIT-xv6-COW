@@ -34,6 +34,46 @@ trapinithart(void)
 // called from, and returns to, trampoline.S
 // return value is user satp for trampoline.S to switch to.
 //
+// Handle copy-on-write page fault
+int
+cowhandler(pagetable_t pagetable, uint64 va)
+{
+  if(va >= MAXVA)
+    return -1;
+
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_V) == 0)
+    return -1;
+  if((*pte & PTE_U) == 0)
+    return -1;
+
+  // Check if it's a COW page
+  if((*pte & PTE_COW) == 0)
+    return -1;
+
+  uint64 pa = PTE2PA(*pte);
+  uint flags = PTE_FLAGS(*pte);
+
+  // Allocate new page
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1;
+
+  // Copy old page to new page
+  memmove(mem, (char*)pa, PGSIZE);
+
+  // Update PTE: remove COW flag, add write permission
+  flags = (flags & ~PTE_COW) | PTE_W;
+  *pte = PA2PTE((uint64)mem) | flags;
+
+  // Decrement reference count of old page
+  kfree((void*)pa);
+
+  return 0;
+}
+
 uint64
 usertrap(void)
 {
@@ -68,9 +108,19 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if((r_scause() == 15 || r_scause() == 13) &&
-            vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
-    // page fault on lazily-allocated page
+  } else if(r_scause() == 15) {  // Store page fault
+    uint64 va = r_stval();
+    // Try COW handler first
+    if(cowhandler(p->pagetable, va) < 0) {
+      // If COW handler fails, try vmfault for lazy allocation
+      uint64 fault_result = vmfault(p->pagetable, va, 1);
+      if(fault_result == 0) {
+        // Both COW and vmfault failed - invalid access
+        printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+        printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+        setkilled(p);
+      }
+    }
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());

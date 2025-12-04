@@ -11,6 +11,10 @@
 
 void freerange(void *pa_start, void *pa_end);
 
+int getrefcnt(void *);
+void increfcnt(void *);
+int decrefcnt(void *);
+
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
@@ -23,11 +27,49 @@ struct {
   struct run *freelist;
 } kmem;
 
+struct {
+  struct spinlock lock;
+  int count[PHYSTOP / PGSIZE];  // Reference count for each physical page
+} refcnt;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&refcnt.lock, "refcnt");
   freerange(end, (void*)PHYSTOP);
+}
+
+// Get reference count for a physical address
+int
+getrefcnt(void *pa)
+{
+  return refcnt.count[(uint64)pa / PGSIZE];
+}
+
+// Increment reference count
+void
+increfcnt(void *pa)
+{
+  if((uint64)pa % PGSIZE != 0 || (uint64)pa >= PHYSTOP)
+    panic("increfcnt");
+  
+  acquire(&refcnt.lock);
+  refcnt.count[(uint64)pa / PGSIZE]++;
+  release(&refcnt.lock);
+}
+
+// Decrement reference count and return new count
+int
+decrefcnt(void *pa)
+{
+  if((uint64)pa % PGSIZE != 0 || (uint64)pa >= PHYSTOP)
+    panic("decrefcnt");
+  
+  acquire(&refcnt.lock);
+  int cnt = --refcnt.count[(uint64)pa / PGSIZE];
+  release(&refcnt.lock);
+  return cnt;
 }
 
 void
@@ -50,6 +92,10 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  // Only free if reference count reaches 0
+  if(decrefcnt(pa) > 0)
+    return;
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -76,7 +122,9 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r) {
     memset((char*)r, 5, PGSIZE); // fill with junk
+    refcnt.count[(uint64)r / PGSIZE] = 1;
+  }
   return (void*)r;
 }
